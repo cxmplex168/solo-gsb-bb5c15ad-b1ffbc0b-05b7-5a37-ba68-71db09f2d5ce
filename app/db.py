@@ -18,7 +18,33 @@ import threading
 from datetime import datetime, timezone
 from typing import Any
 
-_SCHEMA = """
+def _rules_table_sql(table_name: str) -> str:
+    # Priority is stored as TEXT on purpose: the API accepts any non-negative
+    # integer (Python ints are arbitrary precision) and values beyond the
+    # signed-64 SQLite INTEGER range (e.g. 2**63) overflow an INTEGER column.
+    # The canonical decimal text preserves the exact value; readers parse it
+    # back with int(), the same arrangement used for ``covered`` (IPv6 counts
+    # also exceed 2**63).
+    return f"""
+CREATE TABLE IF NOT EXISTS {table_name} (
+    analysis_id   TEXT NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+    rule_index    INTEGER NOT NULL,
+    rule_id       TEXT NOT NULL,
+    cidr          TEXT NOT NULL,
+    ip_version    INTEGER NOT NULL,
+    action        TEXT NOT NULL,
+    priority      TEXT NOT NULL,
+    source_tag    TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    covered       TEXT NOT NULL,
+    has_conflict  INTEGER NOT NULL,
+    PRIMARY KEY (analysis_id, rule_index)
+);
+"""
+
+
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS analyses (
     id               TEXT PRIMARY KEY,
     name             TEXT,
@@ -29,21 +55,7 @@ CREATE TABLE IF NOT EXISTS analyses (
     result_json      TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS rules (
-    analysis_id   TEXT NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
-    rule_index    INTEGER NOT NULL,
-    rule_id       TEXT NOT NULL,
-    cidr          TEXT NOT NULL,
-    ip_version    INTEGER NOT NULL,
-    action        TEXT NOT NULL,
-    priority      INTEGER NOT NULL,
-    source_tag    TEXT NOT NULL,
-    role          TEXT NOT NULL,
-    status        TEXT NOT NULL,
-    covered       TEXT NOT NULL,
-    has_conflict  INTEGER NOT NULL,
-    PRIMARY KEY (analysis_id, rule_index)
-);
+{_rules_table_sql("rules")}
 
 CREATE TABLE IF NOT EXISTS findings (
     analysis_id   TEXT NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
@@ -168,9 +180,54 @@ def _ensure_unique_hash_index(conn: sqlite3.Connection) -> None:
         conn.execute("COMMIT")
 
 
+def _priority_column_type(conn: sqlite3.Connection) -> str | None:
+    """Declared type of ``rules.priority`` (uppercase), or ``None`` if absent."""
+    for col in conn.execute("PRAGMA table_info(rules)").fetchall():
+        if col["name"] == "priority":
+            return (col["type"] or "").upper() or None
+    return None
+
+
+def _migrate_rules_priority(conn: sqlite3.Connection) -> None:
+    """Rebuild ``rules`` so ``priority`` is TEXT instead of INTEGER.
+
+    Databases created before priorities could exceed the signed-64 SQLite
+    INTEGER range carry ``priority INTEGER``; saving a legal value such as
+    ``9223372036854775808`` then raises OverflowError and the whole version
+    fails to persist. SQLite cannot alter a column's type in place, so the
+    table is rebuilt inside one transaction (DDL is transactional in SQLite):
+    existing values are copied verbatim via ``CAST(priority AS TEXT)`` and the
+    old table/index names are swapped at the end. A failure rolls back to the
+    original INTEGER table, so stored data is never damaged or lost.
+    """
+    if _priority_column_type(conn) == "TEXT":
+        return
+    conn.execute("BEGIN")
+    try:
+        conn.execute("DROP INDEX IF EXISTS idx_rules_analysis")
+        conn.execute(_rules_table_sql("rules_new"))
+        conn.execute(
+            """INSERT INTO rules_new
+               (analysis_id, rule_index, rule_id, cidr, ip_version, action, priority,
+                source_tag, role, status, covered, has_conflict)
+               SELECT analysis_id, rule_index, rule_id, cidr, ip_version, action,
+                      CAST(priority AS TEXT),
+                      source_tag, role, status, covered, has_conflict
+               FROM rules"""
+        )
+        conn.execute("DROP TABLE rules")
+        conn.execute("ALTER TABLE rules_new RENAME TO rules")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rules_analysis ON rules(analysis_id)")
+    except sqlite3.Error:
+        conn.execute("ROLLBACK")
+    else:
+        conn.execute("COMMIT")
+
+
 def init_db() -> None:
     with _connect() as conn:
         conn.executescript(_SCHEMA)
+        _migrate_rules_priority(conn)
         _ensure_unique_hash_index(conn)
 
 
@@ -256,7 +313,7 @@ def save_analysis(
                     r["cidr"],
                     r["ip_version"],
                     r["action"],
-                    r["priority"],
+                    str(r["priority"]),  # priorities may exceed SQLite INTEGER range
                     r["source_tag"],
                     r["role"],
                     r["status"],
@@ -360,6 +417,9 @@ def query_rules(
         rows = conn.execute(sql, params).fetchall()
     result_rows = [dict(r) for r in rows]
     for row in result_rows:
+        # Stored as TEXT to accommodate priorities beyond the 64-bit INTEGER
+        # range (e.g. 2**63); parse back to an exact integer.
+        row["priority"] = int(row["priority"])
         # Stored as TEXT to accommodate IPv6 address counts (>2^63).
         row["covered"] = int(row["covered"])
         row["has_conflict"] = bool(row["has_conflict"])

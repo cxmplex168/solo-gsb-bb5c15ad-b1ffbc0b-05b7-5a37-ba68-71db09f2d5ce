@@ -34,7 +34,9 @@ docker compose up --build -d
 - 健康检查：<http://localhost:8080/health>
 
 SQLite 数据文件保存在命名卷 `prefix_data`（容器内 `/data/prefix_policy.db`），容器重启后
-已保存的分析版本不丢失。停止：`docker compose down`（加 `-v` 同时删除数据卷）。
+已保存的分析版本不丢失。服务启动时自动完成必要的数据库初始化与**旧库结构升级**（例如把
+规则优先级列迁移为可容纳任意非负整数的存储），无需手动迁移命令，升级在单个事务内完成、
+不损坏既有数据。停止：`docker compose down`（加 `-v` 同时删除数据卷）。
 
 ### 不用 Docker，直接本地运行
 
@@ -66,7 +68,7 @@ python -m pytest -q
 | --- | --- |
 | `cidr` | IPv4/IPv6 CIDR，如 `10.0.0.0/8`、`2001:db8::/32`；**主机位必须为 0**（`10.0.0.5/24` 会被拒绝）；**不支持接口作用域**——`fe80::%eth0/128` 这类带 `%zone` 的 IPv6 CIDR 一律拒绝 |
 | `action` | `permit`（别名 `allow`/`accept`/`pass`）或 `deny`（别名 `block`/`drop`/`reject`），大小写不敏感 |
-| `priority` | 整数，**数值越小优先级越高**，默认 `100`。仅用于裁决**完全相同 CIDR** 的规则 |
+| `priority` | **非负整数**，**数值越小优先级越高**，默认 `100`。仅用于裁决**完全相同 CIDR** 的规则。取值不限宽度（如 `9223372036854775808` 这样超过 64 位有符号整数范围的大整数也按原值保存并原样返回，不会被截断或转成浮点） |
 | `source_tag` | 来源标签（自由文本），默认 `default`，如 `hq` / `edge-fw` / `terraform` |
 | `rule_id` | 可选唯一 ID；不填则自动生成 `r1, r2, ...` |
 
