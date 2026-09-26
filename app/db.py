@@ -18,7 +18,27 @@ import threading
 from datetime import datetime, timezone
 from typing import Any
 
-_SCHEMA = """
+# ``priority`` and ``covered`` are decimal TEXT, not INTEGER: the API accepts
+# arbitrary non-negative JSON integers (and IPv6 address counts can exceed
+# 64 bits), while an SQLite INTEGER column is signed 64-bit and binding a
+# larger Python int raises OverflowError. Both are parsed back to int on read.
+_RULES_TABLE_COLUMNS = """\
+    analysis_id   TEXT NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
+    rule_index    INTEGER NOT NULL,
+    rule_id       TEXT NOT NULL,
+    cidr          TEXT NOT NULL,
+    ip_version    INTEGER NOT NULL,
+    action        TEXT NOT NULL,
+    priority      TEXT NOT NULL,
+    source_tag    TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    covered       TEXT NOT NULL,
+    has_conflict  INTEGER NOT NULL,
+    PRIMARY KEY (analysis_id, rule_index)\
+"""
+
+_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS analyses (
     id               TEXT PRIMARY KEY,
     name             TEXT,
@@ -30,19 +50,7 @@ CREATE TABLE IF NOT EXISTS analyses (
 );
 
 CREATE TABLE IF NOT EXISTS rules (
-    analysis_id   TEXT NOT NULL REFERENCES analyses(id) ON DELETE CASCADE,
-    rule_index    INTEGER NOT NULL,
-    rule_id       TEXT NOT NULL,
-    cidr          TEXT NOT NULL,
-    ip_version    INTEGER NOT NULL,
-    action        TEXT NOT NULL,
-    priority      INTEGER NOT NULL,
-    source_tag    TEXT NOT NULL,
-    role          TEXT NOT NULL,
-    status        TEXT NOT NULL,
-    covered       TEXT NOT NULL,
-    has_conflict  INTEGER NOT NULL,
-    PRIMARY KEY (analysis_id, rule_index)
+{_RULES_TABLE_COLUMNS}
 );
 
 CREATE TABLE IF NOT EXISTS findings (
@@ -168,10 +176,76 @@ def _ensure_unique_hash_index(conn: sqlite3.Connection) -> None:
         conn.execute("COMMIT")
 
 
+def _rules_priority_stored_as_text(conn: sqlite3.Connection) -> bool:
+    """Whether the existing ``rules`` table keeps ``priority`` as TEXT.
+
+    A non-empty declared type other than ``TEXT`` (databases created before
+    large priorities were supported declare ``INTEGER``) means the column has
+    NUMERIC/INTEGER affinity and storing a value above the signed 64-bit range
+    fails; such a table needs the rebuild migration below.
+    """
+    cols = {
+        row["name"]: (row["type"] or "").upper()
+        for row in conn.execute("PRAGMA table_info(rules)")
+    }
+    return cols.get("priority") == "TEXT"
+
+
+def _migrate_priority_to_text(conn: sqlite3.Connection) -> None:
+    """Rebuild a legacy ``rules`` table whose ``priority`` is INTEGER as TEXT.
+
+    SQLite cannot alter a column's type in place, so the table is rebuilt
+    inside one transaction (DDL is transactional in SQLite): rename the old
+    table, create the new one with decimal-TEXT ``priority`` (``CAST`` rewrites
+    every existing value losslessly) and recreate the analysis index. The
+    parent ``analyses`` rows are untouched and no table references ``rules``,
+    but foreign keys are disabled for the connection so the rebuild itself
+    never trips a constraint; should anything fail, the rollback restores the
+    original table verbatim.
+    """
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN")
+        try:
+            # The index keeps its name when its table is renamed; drop it up
+            # front so it can be recreated on the new table without a collision.
+            conn.execute("DROP INDEX IF EXISTS idx_rules_analysis")
+            conn.execute("ALTER TABLE rules RENAME TO rules_legacy_priority")
+            conn.execute(f"CREATE TABLE rules (\n{_RULES_TABLE_COLUMNS}\n)")
+            conn.execute(
+                """
+                INSERT INTO rules
+                    (analysis_id, rule_index, rule_id, cidr, ip_version, action, priority,
+                     source_tag, role, status, covered, has_conflict)
+                SELECT analysis_id, rule_index, rule_id, cidr, ip_version, action,
+                       CAST(priority AS TEXT), source_tag, role, status, covered, has_conflict
+                FROM rules_legacy_priority
+                """
+            )
+            conn.execute("CREATE INDEX idx_rules_analysis ON rules(analysis_id)")
+            conn.execute("DROP TABLE rules_legacy_priority")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
+    finally:
+        # Restore the connection default (no-op once the transaction ended).
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def init_db() -> None:
     with _connect() as conn:
         conn.executescript(_SCHEMA)
         _ensure_unique_hash_index(conn)
+        # Upgrade databases whose rules.priority predates TEXT storage, so
+        # legal priorities beyond the signed 64-bit SQLite INTEGER range can be
+        # saved without an OverflowError.
+        rules_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'rules'"
+        ).fetchone()
+        if rules_exists is not None and not _rules_priority_stored_as_text(conn):
+            _migrate_priority_to_text(conn)
 
 
 def reset_db(path: str | None = None) -> None:
@@ -256,7 +330,7 @@ def save_analysis(
                     r["cidr"],
                     r["ip_version"],
                     r["action"],
-                    r["priority"],
+                    str(r["priority"]),  # TEXT: priorities may exceed SQLite's 64-bit INTEGER
                     r["source_tag"],
                     r["role"],
                     r["status"],
@@ -360,7 +434,9 @@ def query_rules(
         rows = conn.execute(sql, params).fetchall()
     result_rows = [dict(r) for r in rows]
     for row in result_rows:
-        # Stored as TEXT to accommodate IPv6 address counts (>2^63).
+        # Stored as decimal TEXT to accommodate values outside INTEGER range:
+        # priorities may exceed 64 bits and IPv6 address counts always can.
+        row["priority"] = int(row["priority"])
         row["covered"] = int(row["covered"])
         row["has_conflict"] = bool(row["has_conflict"])
     return result_rows

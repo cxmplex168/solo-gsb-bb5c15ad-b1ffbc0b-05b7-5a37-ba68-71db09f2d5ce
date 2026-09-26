@@ -66,7 +66,7 @@ python -m pytest -q
 | --- | --- |
 | `cidr` | IPv4/IPv6 CIDR，如 `10.0.0.0/8`、`2001:db8::/32`；**主机位必须为 0**（`10.0.0.5/24` 会被拒绝）；**不支持接口作用域**——`fe80::%eth0/128` 这类带 `%zone` 的 IPv6 CIDR 一律拒绝 |
 | `action` | `permit`（别名 `allow`/`accept`/`pass`）或 `deny`（别名 `block`/`drop`/`reject`），大小写不敏感 |
-| `priority` | 整数，**数值越小优先级越高**，默认 `100`。仅用于裁决**完全相同 CIDR** 的规则 |
+| `priority` | **非负**整数，**数值越小优先级越高**，默认 `100`。仅用于裁决**完全相同 CIDR** 的规则；接受任意大小的非负整数（如 `9223372036854775808` 等超过 64 位范围的值也按原值精确保存与返回） |
 | `source_tag` | 来源标签（自由文本），默认 `default`，如 `hq` / `edge-fw` / `terraform` |
 | `rule_id` | 可选唯一 ID；不填则自动生成 `r1, r2, ...` |
 
@@ -1450,6 +1450,12 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 `409`，保证不会互相覆盖。
 
 `covered` 以十进制文本存储，以容纳超出 64 位整数范围的 IPv6 地址计数（如 /32 的 2^96）。
+`priority` 同样以十进制文本存储：API 接受任意大小的非负整数，而 SQLite 的 INTEGER
+是有符号 64 位列，直接绑定更大的 Python 整数会在保存时溢出（`OverflowError`）；读取时
+两列都解析回整数，`GET /api/analyses/{id}` 与 `GET /api/analyses/{id}/rules` 返回的都是
+精确 JSON 整数（不加引号、不丢精度）。服务启动（`init_db`，即 `docker compose up`
+容器启动）时会自动检测旧库的 `rules.priority INTEGER` 并在单个事务内重建该表完成升级，
+已有版本数据原样保留；升级可重复执行。
 
 ### 指纹规则与幂等（ruleset_hash）
 
